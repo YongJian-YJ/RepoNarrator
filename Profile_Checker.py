@@ -180,99 +180,144 @@ def detect_language(file_name):
     return extension_map.get(ext, "unknown")
 
 
-def fetch_code_file(owner, repo_name, path="", visited=None, depth=0, max_depth=5):
+def fetch_code_files(
+    owner, repo_name, path="", visited=None, depth=0, max_depth=3, max_functions=2
+):
     """
-    Recursively fetch the content of the first code file with a function in the repository.
-    Returns: (code_text, language, (snippet, function_block)) or (None, None, None)
+    Memory-efficient version of fetch_code_files with better error handling and resource management.
     """
     if depth > max_depth:
         print(f"Reached max depth ({max_depth}) at {path}. Stopping recursion.")
-        return None, None, None
+        return []
 
     if visited is None:
         visited = set()
 
+    results = []
+
     url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+
+    # Explicitly close connections and manage resources
     try:
-        response = session.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            print(f"Failed to fetch contents at {url}: {response.status_code}")
-            return None, None, None
+        # Use a context manager for the response to ensure resources are released
+        with session.get(url, headers=headers, timeout=10) as response:
+            if response.status_code != 200:
+                print(f"Failed to fetch contents at {url}: {response.status_code}")
+                return results
+
+            # Parse contents immediately and clear response data
+            try:
+                contents = response.json()
+            except Exception as e:
+                print(f"Error parsing JSON from {url}: {e}")
+                return results
     except requests.exceptions.RequestException as e:
         print(f"Error fetching contents at {url}: {e}")
-        time.sleep(1)
-        return None, None, None
+        time.sleep(2)  # Longer backoff time
+        return results
 
-    contents = response.json()
+    # Garbage collect to free memory
+    import gc
+
+    gc.collect()
+
+    # Process only a limited number of files at once
     supported_extensions = [".py", ".c", ".java", ".js"]
+    file_items = [
+        item
+        for item in contents
+        if item["type"] == "file"
+        and any(item["name"].lower().endswith(ext) for ext in supported_extensions)
+    ]
 
-    print(f"Checking directory: {path if path else 'root'} (depth: {depth})")
+    # Limit number of files processed per directory
+    file_items = file_items[:5]  # Process at most 5 files per directory
 
-    for item in contents:
+    for item in file_items:
         item_path = item["path"]
-        item_type = item["type"]
-
-        print(f"Processing item: {item_path} (type: {item_type})")
 
         if item_path in visited:
-            print(f"Skipping already visited: {item_path}")
             continue
 
         visited.add(item_path)
 
-        if item_type == "file" and any(
-            item["name"].lower().endswith(ext) for ext in supported_extensions
-        ):
-            print(f"Found file: {item_path}")
-            try:
-                download_url = item["download_url"]
-                code_response = session.get(download_url, headers=headers, timeout=10)
-                if code_response.status_code == 200:
-                    language = detect_language(item["name"])
-                    code_text = code_response.text
-                    snippet, function_block = extract_useful_function(code_text)
-                    if snippet and function_block:
-                        print(f"Found useful function in {item_path}: {snippet}")
-                        return code_text, language, (snippet, function_block)
-                    else:
-                        print(f"No useful function found in {item_path}")
-                else:
-                    print(
-                        f"Failed to download {item_path}: {code_response.status_code}"
-                    )
-            except requests.exceptions.RequestException as e:
-                print(f"Error downloading {item_path}: {e}")
-                time.sleep(1)
-            finally:
-                if "code_response" in locals():
-                    code_response.close()
+        # Get file metadata but don't download yet
+        download_url = item.get("download_url")
+        if not download_url:
+            continue
 
-        elif item_type in ("dir", "submodule", "symlink"):
-            print(f"Entering subdirectory: {item_path} (depth: {depth + 1})")
-            sub_result, sub_language, sub_function = fetch_code_file(
-                owner, repo_name, item_path, visited, depth + 1, max_depth
+        # Process the file
+        try:
+            with session.get(
+                download_url, headers=headers, timeout=10
+            ) as code_response:
+                if code_response.status_code != 200:
+                    continue
+
+                language = detect_language(item["name"])
+                code_text = code_response.text
+
+                # Extract functions with a size limit
+                file_functions = extract_all_functions(
+                    code_text, max_functions=2, max_chars=500
+                )
+
+                for snippet, function_block in file_functions:
+                    results.append((code_text, language, (snippet, function_block)))
+
+                    # Break early if we have enough functions
+                    if len(results) >= max_functions:
+                        return results
+        except Exception as e:
+            print(f"Error processing {item_path}: {e}")
+
+        # Force garbage collection after each file
+        gc.collect()
+        time.sleep(0.5)  # Add delay between requests
+
+    # Then process a limited number of directories
+    if len(results) < max_functions:
+        dir_items = [
+            item for item in contents if item["type"] in ("dir", "submodule", "symlink")
+        ]
+
+        # Limit directories processed
+        dir_items = dir_items[:2]  # Process at most 2 subdirectories per level
+
+        for item in dir_items:
+            item_path = item["path"]
+
+            sub_results = fetch_code_files(
+                owner,
+                repo_name,
+                item_path,
+                visited,
+                depth + 1,
+                max_depth,
+                max_functions - len(results),
             )
-            if sub_result and sub_language and sub_function:
-                return sub_result, sub_language, sub_function
-            time.sleep(0.5)
 
-    return None, None, None
+            results.extend(sub_results)
+            if len(results) >= max_functions:
+                return results[:max_functions]
+
+            gc.collect()  # Force garbage collection
+            time.sleep(1)  # Longer delay between directory processing
+
+    return results
 
 
-def extract_useful_function(code_text, max_chars=1000):
-    """Extract a useful function definition and its block from the code."""
+def extract_all_functions(code_text, max_functions=3, max_chars=1000):
+    """Extract multiple useful function definitions from the code."""
     if not code_text:
-        return None, None
+        return []
 
     # Updated regex to capture "async def" as well
     function_keywords = r"\b(async\s+def|def|function|int|void|float|double|char|public|private|protected)\b"
     lines = code_text.split("\n")
-    function_block = []
-    in_function = False
-    indent_level = 0
-    brace_count = 0
-    snippet = None
+    results = []
+    i = 0
 
     # Adjusted common utility function names (removed 'main')
     common_functions = {
@@ -292,73 +337,94 @@ def extract_useful_function(code_text, max_chars=1000):
         "loop",
     }
 
-    for i, line in enumerate(lines):
+    while i < len(lines) and len(results) < max_functions:
+        line = lines[i]
         stripped_line = line.strip()
-        if not in_function and re.search(function_keywords, stripped_line):
-            # Updated regex includes async def
+
+        if re.search(function_keywords, stripped_line):
             match = re.search(
                 r"\b(async\s+def|def|function|int|void|float|double|char|public|private|protected)\s+(\w+)\s*\(",
                 stripped_line,
             )
+
             if match:
                 function_name = match.group(2)
                 print(f"Detected function: {function_name}")
+
                 if function_name.lower() in common_functions:
                     print(f"Skipping common function: {function_name}")
+                    i += 1
                     continue
 
-                in_function = True
-                snippet = stripped_line
+                # Extract function block
+                function_block = []
                 function_block.append(line)
+                snippet = stripped_line
+
+                # Track braces or indentation
                 if "{" in stripped_line:
                     brace_count = line.count("{") - line.count("}")
+                    j = i + 1
+                    while j < len(lines) and brace_count > 0:
+                        next_line = lines[j]
+                        function_block.append(next_line)
+                        brace_count += next_line.count("{") - next_line.count("}")
+                        j += 1
+                        if len("\n".join(function_block)) > max_chars:
+                            break
                 else:
                     indent_level = len(line) - len(line.lstrip())
-        elif in_function:
-            function_block.append(line)
-            if brace_count > 0:
-                brace_count += line.count("{") - line.count("}")
-                if brace_count <= 0:
-                    break
-            else:
-                current_indent = len(line) - len(line.lstrip())
-                if stripped_line == "" or (
-                    current_indent <= indent_level and stripped_line
-                ):
-                    break
-        if in_function and len("\n".join(function_block)) > max_chars:
-            break
+                    j = i + 1
+                    while j < len(lines):
+                        next_line = lines[j]
+                        next_stripped = next_line.strip()
+                        current_indent = len(next_line) - len(next_line.lstrip())
 
-    if not function_block:
-        print("No function block extracted.")
-        return None, None
+                        if next_stripped == "":
+                            function_block.append(next_line)
+                        elif current_indent <= indent_level and next_stripped:
+                            break
+                        else:
+                            function_block.append(next_line)
 
-    function_text = "\n".join(function_block)
-    complexity_indicators = [
-        r"\bif\b",
-        r"\bfor\b",
-        r"\bwhile\b",
-        r"\btry\b",
-        r"\bexcept\b",
-        r"\bthrow\b",
-        r"\breturn\b",
-        r"\braise\b",
-        r"\bassert\b",
-    ]
-    has_complexity = any(
-        re.search(indicator, function_text, re.IGNORECASE)
-        for indicator in complexity_indicators
-    )
-    line_count = len(function_block)
-    print(
-        f"Function complexity: has_complexity={has_complexity}, line_count={line_count}"
-    )
-    # Accept functions that are at least 2 lines long even if they lack complexity
-    if not has_complexity and line_count < 2:
-        print("Function not considered useful: lacks complexity or is too short.")
-        return None, None
+                        j += 1
+                        if len("\n".join(function_block)) > max_chars:
+                            break
 
-    return snippet, function_text
+                function_text = "\n".join(function_block)
+
+                # Check if the function has complexity
+                complexity_indicators = [
+                    r"\bif\b",
+                    r"\bfor\b",
+                    r"\bwhile\b",
+                    r"\btry\b",
+                    r"\bexcept\b",
+                    r"\bthrow\b",
+                    r"\breturn\b",
+                    r"\braise\b",
+                    r"\bassert\b",
+                ]
+                has_complexity = any(
+                    re.search(indicator, function_text, re.IGNORECASE)
+                    for indicator in complexity_indicators
+                )
+                line_count = len(function_block)
+
+                # Accept functions that are at least 2 lines long even if they lack complexity
+                if has_complexity or line_count >= 2:
+                    results.append((snippet, function_text))
+                    print(
+                        f"Found useful function: {function_name}, length: {line_count} lines"
+                    )
+
+                # Skip to after this function
+                i = j
+                continue
+
+        i += 1
+
+    return results
 
 
 def search_snippet(snippet, language="python"):
@@ -382,98 +448,181 @@ def search_snippet(snippet, language="python"):
         return 0
 
 
+def analyze_code_style(code_text):
+    """Analyze the code style based on various metrics."""
+    if not code_text:
+        return {}
+
+    # Count lines with comments (excluding empty comment lines)
+    comment_lines = sum(
+        1
+        for line in code_text.split("\n")
+        if line.strip().startswith(("#", "//")) and len(line.strip()) > 2
+    )
+
+    # Count total non-empty lines
+    total_lines = sum(1 for line in code_text.split("\n") if line.strip())
+
+    # Check for docstrings
+    has_docstring = '"""' in code_text or "'''" in code_text
+
+    # Check for descriptive variable names (more than 1 character)
+    variable_pattern = r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*="
+    variables = re.findall(variable_pattern, code_text)
+    descriptive_vars = sum(1 for var in variables if len(var) > 1)
+    single_char_vars = sum(1 for var in variables if len(var) == 1)
+
+    # Calculate indentation consistency
+    indentation_pattern = r"^(\s*)[^\s]"
+    indentations = [
+        len(re.match(indentation_pattern, line).group(1))
+        for line in code_text.split("\n")
+        if line.strip() and re.match(indentation_pattern, line)
+    ]
+
+    indent_sizes = set(indentations) - {0}
+    consistent_indentation = len(indent_sizes) <= 2
+
+    # Line length (80 chars is standard in many styles)
+    long_lines = sum(1 for line in code_text.split("\n") if len(line) > 100)
+
+    return {
+        "comment_ratio": round(comment_lines / total_lines, 2) if total_lines else 0,
+        "has_docstring": has_docstring,
+        "descriptive_vars": descriptive_vars,
+        "single_char_vars": single_char_vars,
+        "consistent_indentation": consistent_indentation,
+        "long_lines_ratio": round(long_lines / total_lines, 2) if total_lines else 0,
+        "total_lines": total_lines,
+    }
+
+
 def generate_code_fingerprint(selected_repo_names):
-    """
-    Generate a code usage fingerprint and summary using LLM for selected repositories.
-    Returns a tuple: (fingerprint_summary, snippet_details)
-    """
+    """Memory-efficient version of the code fingerprint generator."""
     owner = st.session_state.github_username
     repos = st.session_state.repos
     if not repos:
-        st.write("No repositories loaded.")
         return "No repositories loaded.", []
 
-    # Filter repos based on selected names
+    # Limit selection size
+    selected_repo_names = selected_repo_names[:3]  # Limit to 3 repos max
     selected_repos = [repo for repo in repos if repo["name"] in selected_repo_names]
-    if not selected_repos:
-        st.write("No valid repositories selected.")
-        return "No valid repositories selected.", []
 
     snippet_details = []
     search_results = []
-    full_files = []
 
-    for repo in selected_repos[:3]:
+    # We'll store only unique code samples for style analysis
+    unique_repo_code = {}
+
+    max_functions_per_repo = 2
+
+    for repo in selected_repos:
         repo_name = repo["name"]
-        print(f"\nProcessing repository: {repo_name}")
-        code_text, language, function_data = fetch_code_file(owner, repo_name)
-        if code_text and language != "unknown" and function_data:
-            snippet, _ = function_data
-            matches = search_snippet(snippet, language)
-            snippet_details.append(
-                {
-                    "function_name": (
-                        snippet.split("(")[0].strip() if "(" in snippet else snippet
-                    ),
-                    "repo_name": repo_name,
-                    "matches": matches,
-                    "code_snippet": code_text,
-                    "purpose": "This function serves a specific role in the repository. (Auto-extracted)",
-                    "usage": "Usage information not available automatically.",
-                    "notes": "No additional notes available.",
-                }
-            )
-            search_results.append((repo_name, snippet, matches))
-            full_files.append((repo_name, code_text))
-        else:
-            st.warning(
-                f"No useful function found in {repo_name} after searching all directories. Skipping this repository."
+        with st.spinner(f"Analyzing {repo_name}..."):
+            # Get limited functions from each repo
+            results = fetch_code_files(
+                owner,
+                repo_name,
+                max_depth=2,  # Reduce max depth
+                max_functions=max_functions_per_repo,
             )
 
-    search_summary = (
-        "\n".join(
-            [
-                f"- Repository '{repo}': Code snippet used for search: '{snippet}' | Similarity found in {matches} repositories"
-                for repo, snippet, matches in search_results
-            ]
-        )
-        if search_results
-        else "No snippets found."
-    )
+            if not results:
+                st.warning(f"No functions found in {repo_name}.")
+                continue
 
-    code_summary = (
-        "\n\n".join(
-            [f"Full file from {repo}:\n{sample}" for repo, sample in full_files]
-        )
-        if full_files
-        else "No files with useful functions available."
-    )
+            # Keep track of unique functions to avoid duplicates
+            seen_snippets = set()
 
+            for code_text, language, function_data in results:
+                snippet, function_block = function_data
+
+                # Skip duplicates
+                if snippet in seen_snippets:
+                    continue
+                seen_snippets.add(snippet)
+
+                # Store one complete code sample per repo for style analysis
+                if repo_name not in unique_repo_code:
+                    # Just store a reference to avoid duplicating the full code in memory
+                    unique_repo_code[repo_name] = code_text
+
+                # Do search with a more defensive approach
+                try:
+                    matches = search_snippet(snippet, language)
+                except Exception as e:
+                    print(f"Error searching snippet: {e}")
+                    matches = 0
+
+                # Analyze code style on the function block only, not the whole file
+                style_metrics = analyze_code_style(function_block)
+
+                # Create a smaller snippet detail object
+                function_name = (
+                    snippet.split("(")[0].strip() if "(" in snippet else snippet
+                )
+                snippet_details.append(
+                    {
+                        "function_name": function_name,
+                        "repo_name": repo_name,
+                        "matches": matches,
+                        "code_snippet": function_block[:500],  # Limit size
+                        "language": language,
+                        "style_metrics": style_metrics,
+                    }
+                )
+
+                search_results.append((repo_name, snippet, matches, language))
+
+                # Force memory cleanup
+                import gc
+
+                gc.collect()
+
+    # Generate minimal summaries for UI display
+    if search_results:
+        search_summary_items = []
+        for repo, snippet, matches, lang in search_results:
+            function_name = snippet.split("(")[0].strip() if "(" in snippet else snippet
+            originality = (
+                "Highly original"
+                if matches < 5
+                else ("Common" if matches < 20 else "Very common")
+            )
+            search_summary_items.append(
+                f"- **{repo}**: Function `{function_name}` ({lang}) - {matches} matches - {originality}"
+            )
+        search_summary = "\n".join(search_summary_items)
+    else:
+        search_summary = "No snippets found."
+
+    # Create a simplified style summary based on the unique repo code
+    style_summary = "## Code Style Analysis:\n\n"
+    for repo_name, code_text in unique_repo_code.items():
+        metrics = analyze_code_style(code_text)
+        style_summary += f"### {repo_name}:\n"
+        style_summary += f"- Documentation: {'Has docstrings' if metrics.get('has_docstring') else 'No docstrings'}\n"
+        style_summary += f"- Comment ratio: {metrics.get('comment_ratio', 0):.2f}\n"
+        style_summary += f"- Lines of code: {metrics.get('total_lines', 0)}\n\n"
+
+    # Build a simpler prompt to reduce memory usage during LLM processing
     prompt = f"""
-    Below are the search results for code snippets extracted from the user's repositories. Each entry includes:
-    - The repository name.
-    - The code snippet that was used for searching.
-    - The number of repositories where a similar code snippet was found.
-    - (Optionally, if available, the sources or repository names where similar code is found.)
-
-    Search Summary:
+    # Code Analysis Summary
+    
+    ## Function Search Results:
     {search_summary}
-
-    Below are the full files from the user's repositories containing the extracted functions,
-    which are used to evaluate coding style, structure, and documentation practices:
-
-    {code_summary}
-
-    Please provide a detailed analysis covering:
-    1. The originality of the user's code based on the provided search results.
-    2. A breakdown of the specific code snippets used for searching and their relevance.
-    3. The number of similarities found for each snippet.
-    4. (Optionally) Any information on the sources where similar code was found.
-    5. An overall assessment of the coding style, structure, and documentation practices.
-
-    Provide a well-structured, comprehensive summary.
+    
+    {style_summary}
+    
+    Please provide a brief code analysis covering:
+    1. Code originality assessment
+    2. Coding style analysis
+    3. Technical skill assessment
+    4. Overall developer profile
+    
+    Keep your response concise and focused on the main insights.
     """
-    prompt = auto_escape_prompt(prompt)
+
     try:
         llm = ChatOllama(
             model="gemma3:1b",
@@ -484,8 +633,8 @@ def generate_code_fingerprint(selected_repo_names):
         response = chain.invoke({})
         return response.content, snippet_details
     except Exception as e:
-        print(f"Error generating fingerprint summary: {e}")
-        return f"Error generating summary: {str(e)}", snippet_details
+        error_msg = f"Error generating summary: {str(e)}"
+        return error_msg, snippet_details
 
 
 # --- Streamlit UI ---
@@ -540,15 +689,15 @@ if st.session_state.repos:
     repo_names = [repo["name"] for repo in st.session_state.repos]
     default_selection = repo_names[:3] if len(repo_names) >= 3 else repo_names
     selected_repos = st.multiselect(
-        "Select up to 3 repositories to analyze:",
+        "Select up to 5 repositories to analyze:",  # Increased from 3 to 5
         options=repo_names,
         default=default_selection,
-        max_selections=3,
+        max_selections=5,  # Increased from 3 to 5
         key="selected_repos",
     )
-    if len(selected_repos) == 3:
+    if len(selected_repos) == 5:  # Updated from 3 to 5
         st.info(
-            "You’ve selected the maximum of 3 repositories. Deselect one to choose another."
+            "You've selected the maximum of 5 repositories. Deselect one to choose another."
         )
     if st.button("Generate Code Fingerprint"):
         with st.spinner("Analyzing code usage..."):
@@ -556,11 +705,11 @@ if st.session_state.repos:
                 selected_repos
             )
         st.write("### Code Usage Fingerprint Summary")
-        st.write(fingerprint_summary)
+        st.markdown(fingerprint_summary)  # Using markdown to render formatting
 
         st.subheader("Code Snippets Searched from GitHub Database")
         if snippet_details:
-            for detail in snippet_details:
+            for i, detail in enumerate(snippet_details):
                 func_name = detail.get("function_name", "Unnamed Function")
                 repo = detail.get("repo_name", "Unknown Repo")
                 matches = detail.get("matches", "N/A")
@@ -568,15 +717,64 @@ if st.session_state.repos:
                 usage_info = detail.get("usage", "No usage info provided.")
                 notes = detail.get("notes", "No additional notes available.")
                 code_snippet = detail.get("code_snippet", "No code available.")
+                lang = detail.get("language", "python")
 
-                st.write(f"**{func_name} Function (from {repo}):**")
-                st.write(f"**Purpose:** {purpose}")
-                st.write(f"**Usage:** {usage_info}")
-                st.write(f"**Similarity:** Found in {matches} repositories")
-                st.write(f"**Notes:** {notes}")
+                # Add style metrics visual representation
+                style_metrics = detail.get("style_metrics", {})
 
+                # Create a more visually appealing display for each function
+                st.markdown(f"#### {i+1}. **{func_name}** Function")
+                st.markdown(f"**From:** {repo} | **Language:** {lang.capitalize()}")
+
+                # Display a more visual metric for similarity
+                if matches == 0:
+                    st.success(
+                        f"🔰 **Unique:** No similar code found in other repositories"
+                    )
+                elif matches < 5:
+                    st.success(
+                        f"✅ **Mostly Original:** Found in only {matches} repositories"
+                    )
+                elif matches < 20:
+                    st.warning(f"⚠️ **Common Pattern:** Found in {matches} repositories")
+                else:
+                    st.error(f"🔄 **Very Common:** Found in {matches} repositories")
+
+                # Code style metrics as a horizontal layout
+                if style_metrics:
+                    cols = st.columns(3)
+                    with cols[0]:
+                        doc_status = (
+                            "✅" if style_metrics.get("has_docstring", False) else "❌"
+                        )
+                        st.markdown(f"**Documentation:** {doc_status}")
+
+                    with cols[1]:
+                        comment_ratio = style_metrics.get("comment_ratio", 0)
+                        comment_icon = (
+                            "✅"
+                            if comment_ratio > 0.1
+                            else ("⚠️" if comment_ratio > 0 else "❌")
+                        )
+                        st.markdown(
+                            f"**Comments:** {comment_icon} ({comment_ratio:.0%})"
+                        )
+
+                    with cols[2]:
+                        desc_vars = style_metrics.get("descriptive_vars", 0)
+                        single_vars = style_metrics.get("single_char_vars", 0)
+                        naming_icon = (
+                            "✅"
+                            if desc_vars > single_vars * 2
+                            else ("⚠️" if desc_vars > single_vars else "❌")
+                        )
+                        st.markdown(f"**Variable Names:** {naming_icon}")
+
+                # Code snippet in an expander
                 with st.expander("Show full code snippet"):
-                    st.code(code_snippet, language="python")
+                    st.code(code_snippet, language=lang)
+
+                st.markdown("---")  # Divider between functions
         else:
             st.write("No code snippets available for display.")
 else:

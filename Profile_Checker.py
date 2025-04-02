@@ -1,3 +1,6 @@
+# conda activate chat-with-website
+# streamlit run Profile_checker.py
+
 import os
 import re
 import streamlit as st
@@ -6,6 +9,18 @@ from langchain_community.chat_models import ChatOllama
 from langchain.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 import time
+
+# Load Model
+# llm = ChatOllama(
+#     model="llama3.1:8b",
+#     temperature=0.0,
+#     base_url="http://localhost:8888",
+# )
+
+llm = ChatOllama(
+    model="gemma3:1b",
+    temperature=0.0,
+)
 
 # Load environment variables
 load_dotenv()
@@ -97,10 +112,6 @@ def generate_readme_summary(repo_name, readme_text):
     """
     prompt = auto_escape_prompt(prompt)
     try:
-        llm = ChatOllama(
-            model="gemma3:1b",
-            temperature=0.0,
-        )
         prompt_template = ChatPromptTemplate.from_template(prompt)
         chain = prompt_template | llm
         response = chain.invoke({})
@@ -140,7 +151,6 @@ def summarize_all_repos():
 
 
 def introduce_him(all_concatenated_summaries):
-    """Using the concatenated summaries, introduce who the developer is."""
     prompt = f"""
     Below are concatenated summaries of the README files from a developer's GitHub repositories:
 
@@ -157,10 +167,6 @@ def introduce_him(all_concatenated_summaries):
     """
     prompt = auto_escape_prompt(prompt)
     try:
-        llm = ChatOllama(
-            model="gemma3:1b",
-            temperature=0.0,
-        )
         prompt_template = ChatPromptTemplate.from_template(prompt)
         chain = prompt_template | llm
         response = chain.invoke({})
@@ -497,8 +503,41 @@ def analyze_code_style(code_text):
     }
 
 
+def analyze_function_detail(detail):
+    """
+    Analyze an individual function using the LLM.
+    The prompt asks for code originality, style, technical depth, and developer insights.
+    """
+    function_name = detail.get("function_name", "Unnamed Function")
+    code_snippet = detail.get("code_snippet", "No code available.")
+    language = detail.get("language", "python")
+    prompt = f"""
+    Please analyze the following function:
+
+    Function Name: {function_name}
+    Language: {language}
+
+    Code Snippet:
+    {code_snippet}
+
+    Provide a concise analysis covering:
+    1. Code originality – is this implementation unique or a standard pattern?
+    2. Coding style and readability – quality of comments, variable naming, and structure.
+    3. Technical depth – use of language features, complexity, and efficiency.
+    4. Developer insight – what does this function reveal about the developer’s skills and approach?
+    """
+    prompt = auto_escape_prompt(prompt)
+    try:
+        prompt_template = ChatPromptTemplate.from_template(prompt)
+        chain = prompt_template | llm
+        response = chain.invoke({})
+        return response.content
+    except Exception as e:
+        return f"Error analyzing function {function_name}: {str(e)}"
+
+
 def generate_code_fingerprint(selected_repo_names):
-    """Memory-efficient version of the code fingerprint generator."""
+    """Memory-efficient version of the code fingerprint generator with inline per-function analysis."""
     owner = st.session_state.github_username
     repos = st.session_state.repos
     if not repos:
@@ -510,8 +549,6 @@ def generate_code_fingerprint(selected_repo_names):
 
     snippet_details = []
     search_results = []
-
-    # We'll store only unique code samples for style analysis
     unique_repo_code = {}
 
     max_functions_per_repo = 2
@@ -519,7 +556,6 @@ def generate_code_fingerprint(selected_repo_names):
     for repo in selected_repos:
         repo_name = repo["name"]
         with st.spinner(f"Analyzing {repo_name}..."):
-            # Get limited functions from each repo
             results = fetch_code_files(
                 owner,
                 repo_name,
@@ -531,33 +567,23 @@ def generate_code_fingerprint(selected_repo_names):
                 st.warning(f"No functions found in {repo_name}.")
                 continue
 
-            # Keep track of unique functions to avoid duplicates
             seen_snippets = set()
-
             for code_text, language, function_data in results:
                 snippet, function_block = function_data
-
-                # Skip duplicates
                 if snippet in seen_snippets:
                     continue
                 seen_snippets.add(snippet)
 
-                # Store one complete code sample per repo for style analysis
                 if repo_name not in unique_repo_code:
-                    # Just store a reference to avoid duplicating the full code in memory
                     unique_repo_code[repo_name] = code_text
 
-                # Do search with a more defensive approach
                 try:
                     matches = search_snippet(snippet, language)
                 except Exception as e:
                     print(f"Error searching snippet: {e}")
                     matches = 0
 
-                # Analyze code style on the function block only, not the whole file
                 style_metrics = analyze_code_style(function_block)
-
-                # Create a smaller snippet detail object
                 function_name = (
                     snippet.split("(")[0].strip() if "(" in snippet else snippet
                 )
@@ -571,15 +597,13 @@ def generate_code_fingerprint(selected_repo_names):
                         "style_metrics": style_metrics,
                     }
                 )
-
                 search_results.append((repo_name, snippet, matches, language))
 
-                # Force memory cleanup
                 import gc
 
                 gc.collect()
 
-    # Generate minimal summaries for UI display
+    # Generate UI summaries for display (as before)
     if search_results:
         search_summary_items = []
         for repo, snippet, matches, lang in search_results:
@@ -596,7 +620,6 @@ def generate_code_fingerprint(selected_repo_names):
     else:
         search_summary = "No snippets found."
 
-    # Create a simplified style summary based on the unique repo code
     style_summary = "## Code Style Analysis:\n\n"
     for repo_name, code_text in unique_repo_code.items():
         metrics = analyze_code_style(code_text)
@@ -605,56 +628,51 @@ def generate_code_fingerprint(selected_repo_names):
         style_summary += f"- Comment ratio: {metrics.get('comment_ratio', 0):.2f}\n"
         style_summary += f"- Lines of code: {metrics.get('total_lines', 0)}\n\n"
 
-    # Build a simpler prompt to reduce memory usage during LLM processing
-    prompt = f"""
-    # Code Analysis Summary
-    
-    ## Function Search Results:
-    {search_summary}
-    
-    {style_summary}
-    
-    Please provide a brief code analysis covering:
-    1. Code originality assessment
-    2. Coding style analysis
-    3. Technical skill assessment
-    4. Overall developer profile
-    
-    Keep your response concise and focused on the main insights.
-    """
+    # Now, perform inline analysis for each extracted function
+    function_analysis_results = []
+    for detail in snippet_details:
+        analysis = analyze_function_detail(detail)
+        detail["analysis"] = analysis  # Store the analysis with the snippet details
+        function_analysis_results.append(analysis)
 
-    try:
-        llm = ChatOllama(
-            model="gemma3:1b",
-            temperature=0.0,
+    # Combine individual analyses into a final summary for display.
+    combined_analysis = "### Function Analysis:\n\n"
+    for i, detail in enumerate(snippet_details):
+        combined_analysis += (
+            f"#### {i+1}. {detail['function_name']} (from {detail['repo_name']})\n"
         )
-        prompt_template = ChatPromptTemplate.from_template(prompt)
-        chain = prompt_template | llm
-        response = chain.invoke({})
-        return response.content, snippet_details
-    except Exception as e:
-        error_msg = f"Error generating summary: {str(e)}"
-        return error_msg, snippet_details
+        combined_analysis += detail.get("analysis", "No analysis available.") + "\n\n"
+
+    # Return the combined analysis and snippet details for further display.
+    return combined_analysis, snippet_details
 
 
 # --- Streamlit UI ---
-
 st.title("RepoNarrator")
-
 st.text_input("GitHub Username", value="ldw129", key="github_username")
 
-col1, col2 = st.columns(2)
+# Create three columns with better proportions for button alignment
+col1, col2, col3 = st.columns([1, 1, 1])
+
+# Put Load Repos in first column (left)
 with col1:
-    if st.button("Load Repositories"):
+    if st.button("Load Repos", use_container_width=True):
         owner = st.session_state.github_username
         with st.spinner(f"Fetching repositories for {owner}..."):
             st.session_state.repos = fetch_user_repos(owner)
         if st.session_state.repos:
             st.success(f"Found {len(st.session_state.repos)} repositories")
+
+# Leave middle column empty to create space
 with col2:
-    if st.button("Summarize All ReadMe"):
+    pass
+
+# Put Profile Summary in third column (right)
+with col3:
+    if st.button("Create Portfolio Summary", use_container_width=True):
         summarize_all_repos()
 
+# Rest of your code remains the same
 if st.session_state.repos:
     st.subheader(f"Repositories for {st.session_state.github_username}")
     repo_container = st.container()

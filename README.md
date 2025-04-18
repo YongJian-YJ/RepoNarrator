@@ -45,5 +45,3 @@ In addition to summarizing READMEs, RepoNarrator allows users to **select up to 
   - ❗ Plagiarism risk
   - ✅ Code uniqueness
   - 🧑‍🎓 Reuse of common code snippets
-
-Would you like me to generate badges, insert sample screenshots, or tailor the tone for recruiters or developers?

@@ -18,7 +18,7 @@ import time
 # )
 
 llm = ChatOllama(
-    model="gemma3:1b",
+    model="llama3.1:latest",
     temperature=0.0,
 )
 
@@ -109,6 +109,7 @@ def generate_readme_summary(repo_name, readme_text):
     The summary should describe what the project is about, its main features, and any key insights.
     For example, analyze expressions like {{ciphertext_username.hex()}}, {{ciphertext_password.hex()}}, 
     {{secret_password.decode('utf-8')}} and even {{e}} as literal text.
+    Do not ask for follow up questions at the end of the response such as "Do you want me to elaborate on any specific aspect of the project...".
     """
     prompt = auto_escape_prompt(prompt)
     try:
@@ -150,21 +151,24 @@ def summarize_all_repos():
                 st.session_state.all_summaries[repo_name] = summary
 
 
-def introduce_him(all_concatenated_summaries):
+def introduce_him(all_concatenated_summaries, username):
     prompt = f"""
-    Below are concatenated summaries of the README files from a developer's GitHub repositories:
+    You are analyzing the developer profile of a GitHub user based on the following concatenated summaries of their README files:
 
     {all_concatenated_summaries}
 
-    Based on these summaries, please provide a detailed introduction of the person behind these projects. Address:
-    1. Who is this person and what can we infer about their background?
-    2. What are the common themes or topics of their projects?
-    3. What technical abilities, skills, or expertise are demonstrated?
-    4. What hobbies, interests, or non-technical passions might be inferred?
-    5. What unique or special attributes set this person apart?
+    Think step by step to build an insightful and well-rounded profile. Follow this reasoning process:
 
-    Provide a well-structured and comprehensive introduction.
+    1. **Background Inference**: First, identify the likely background of the developer. Consider their education level, professional experience, 
+        and domain focus based on the nature and complexity of their projects.
+    2. **Project Themes**: Identify recurring themes, technologies, or problem domains. Are they focused on web development, machine learning, automation, security, etc.?
+    3. **Technical Competence**: List the programming languages, frameworks, or tools they appear proficient in. Look for patterns in the types of solutions they build.
+    4. **Non-Technical Insights**: Look for hints about personal interests or hobbies—do any project descriptions suggest creative passions, social causes, or areas outside tech?
+    5. **Distinctive Qualities**: Reflect on what makes this developer unique. Do they show a consistent innovation pattern? Strong documentation habits? Collaborative tendencies?
+
+    After going through each step, summarize your findings into a cohesive and well-structured introduction to the developer. Address the developer as {username}.
     """
+
     prompt = auto_escape_prompt(prompt)
     try:
         prompt_template = ChatPromptTemplate.from_template(prompt)
@@ -698,7 +702,8 @@ if st.session_state.all_summaries:
         all_concatenated_summaries += f"### {repo_name}\n{summary.content}\n\n"
 
 if len(all_concatenated_summaries) > 10:
-    response = introduce_him(all_concatenated_summaries)
+    username = st.session_state.github_username
+    response = introduce_him(all_concatenated_summaries, username)
     st.write(f"### Introduction of who {st.session_state.github_username} is")
     st.write(response.content)
 

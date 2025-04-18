@@ -14,7 +14,7 @@
 
 - 📄 **README Summarization**: Aggregates and summarizes repository READMEs to generate a personal profile.
 - 👨‍💻 **Developer Profiling**: Uses an LLM to infer background, skills, project themes, and passions.
-- 🔍 **Code Analysis & Originality Check** *(New)*:
+- 🔍 **Code Analysis & Originality Check**:
   - Recursive function extraction from selected repositories.
   - LLM-based evaluation of coding practices and code style.
   - GitHub Search API integration to assess function originality across GitHub.
